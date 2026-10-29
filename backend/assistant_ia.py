@@ -1,9 +1,10 @@
 import json
 import os
+import re
+import unicodedata
 from datetime import date
 from pathlib import Path
 from typing import Literal
-from uuid import uuid4
 from uuid import UUID, uuid4
 from psycopg.types.json import Jsonb
 from decimal import Decimal
@@ -47,6 +48,7 @@ class MessageHistorique(BaseModel):
 
 
 class MessageAssistant(BaseModel):
+    mode: Literal["formulaire", "vocal"] = "formulaire"
     message: str = Field(min_length=1, max_length=2000)
     historique: list[MessageHistorique] = Field(
         default_factory=list,
@@ -310,6 +312,13 @@ def discuter(demande: MessageAssistant):
         )
 
     proposition = None
+    consigne_suite = (
+        "Après préparation, le serveur demandera le nom et le téléphone, "
+        "puis un accord explicite. Ne renvoie pas vers un formulaire. "
+        if demande.mode == "vocal" else
+        "Après préparation, indique que le client devra remplir le formulaire "
+        "du site et cliquer sur Confirmer. "
+    )
 
     messages = [
         {
@@ -332,9 +341,7 @@ def discuter(demande: MessageAssistant):
                 "preparer_reservation. "
                 "Ne confonds jamais identifiant technique et numéro "
                 "de chambre. "
-                "Après préparation, présente le récapitulatif et indique "
-                "que le client devra remplir le formulaire du site "
-                "et cliquer sur Confirmer. "
+                f"{consigne_suite}"
                 "Une proposition ne bloque aucune chambre. "
                 "Tu ne peux ni enregistrer ni annuler une réservation. "
                 "Ne prétends jamais qu'une réservation est confirmée. "
@@ -433,6 +440,23 @@ def discuter(demande: MessageAssistant):
                         }
                     )
 
+                if proposition is not None:
+                    suite = (
+                        "Quel est votre nom complet ?"
+                        if demande.mode == "vocal" else
+                        "Remplissez le formulaire pour confirmer la réservation."
+                    )
+                    return {
+                        "reponse": (
+                            f"La chambre {proposition['numero']} est proposée du "
+                            f"{proposition['date_arrivee']} au {proposition['date_depart']}, "
+                            f"pour {proposition['nombre_personnes']} personne(s). "
+                            f"Total : {proposition['prix_total']} euros. "
+                            "Cette proposition ne bloque aucune chambre. " + suite
+                        ),
+                        "proposition": proposition,
+                    }
+
         raise HTTPException(
             status_code=502,
             detail="L'assistant n'a pas terminé sa réponse. Réessaie.",
@@ -477,444 +501,387 @@ def discuter(demande: MessageAssistant):
             detail="La consultation de la base de données a échoué.",
         )
 
-@router.post("/conversations", status_code=201)
-def creer_conversation():
-    conversation_id = uuid4()
+# Conversations vocales : l'IA recherche ; le serveur collecte et confirme.
+# Les anciennes routes /message et les formulaires restent compatibles.
 
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO conversations_assistant (
-                    id,
-                    hotel_id
-                )
-                VALUES (%s, %s)
-                RETURNING id, etat;
-                """,
-                (conversation_id, HOTEL_ID),
-            )
-
-            conversation = cursor.fetchone()
-
-    return {
-        "conversation_id": str(conversation["id"]),
-        "etat": conversation["etat"],
-        "message": "Bonjour, pour quelles dates cherchez-vous une chambre ?",
-    }
 class MessageConversation(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
+    request_id: UUID | None = None
 
 
-@router.post("/conversations/{conversation_id}/messages")
-def envoyer_message_conversation(
-    conversation_id: UUID,
-    demande: MessageConversation,
-):
-    texte = demande.message.strip()
-
-    if not texte:
-        raise HTTPException(
-            status_code=400,
-            detail="Le message ne peut pas être vide.",
-        )
-
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT historique, etat, proposition, coordonnees_client
-                FROM conversations_assistant
-                WHERE id = %s AND hotel_id = %s
-                FOR UPDATE;
-                """,
-                (conversation_id, HOTEL_ID),
-            )
-
-            conversation = cursor.fetchone()
-
-            if conversation is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Conversation introuvable.",
-                )
-
-            if conversation["etat"] in (
-                "confirmee",
-                "abandonnee",
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Cette conversation est terminée.",
-                )
-
-            historique = conversation["historique"]
-
-            resultat = discuter(
-                MessageAssistant(
-                    message=texte,
-                    historique=historique[-20:],
-                )
-            )
-
-            nouveaux_messages = [
-                *historique,
-                {"role": "user", "content": texte},
-                {
-                    "role": "assistant",
-                    "content": resultat["reponse"],
-                },
-            ][-20:]
-            nouvelle_proposition = resultat.get("proposition")
-
-            # Une nouvelle proposition remplace l'ancienne.
-            # Sans nouvelle proposition, on conserve celle enregistrée.
-            if nouvelle_proposition is not None:
-                proposition_json = json.loads(
-                    json.dumps(nouvelle_proposition, default=str)
-                )
-                coordonnees = None
-                nouvel_etat = "collecte_coordonnees"
-            else:
-                proposition_json = conversation["proposition"]
-                coordonnees = conversation["coordonnees_client"]
-                nouvel_etat = conversation["etat"]
-
-            cursor.execute(
-                """
-                UPDATE conversations_assistant
-                SET historique = %s,
-                    proposition = %s,
-                    coordonnees_client = %s,
-                    etat = %s,
-                    modifie_le = CURRENT_TIMESTAMP
-                WHERE id = %s AND hotel_id = %s;
-                """,
-                (
-                    Jsonb(nouveaux_messages),
-                    (
-                        Jsonb(proposition_json)
-                        if proposition_json is not None
-                        else None
-                    ),
-                    Jsonb(coordonnees) if coordonnees is not None else None,
-                    nouvel_etat,
-                    conversation_id,
-                    HOTEL_ID,
-                ),
-            )
-
-    return {
-        "conversation_id": str(conversation_id),
-        "reponse": resultat["reponse"],
-        "proposition": proposition_json,
-        "etat": nouvel_etat,
-    }
 class CoordonneesConversation(BaseModel):
-    nom: str = Field(min_length=1, max_length=150)
-    telephone: str = Field(min_length=1, max_length=30)
+    nom: str = Field(min_length=2, max_length=150)
+    telephone: str = Field(min_length=8, max_length=80)
 
 
-@router.post("/conversations/{conversation_id}/coordonnees")
-def enregistrer_coordonnees(
-    conversation_id: UUID,
-    demande: CoordonneesConversation,
-):
-    nom = demande.nom.strip()
-    telephone = demande.telephone.strip()
-
-    if not nom or not telephone:
-        raise HTTPException(
-            status_code=400,
-            detail="Le nom et le téléphone sont obligatoires.",
-        )
-
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT proposition, etat
-                FROM conversations_assistant
-                WHERE id = %s AND hotel_id = %s
-                FOR UPDATE;
-                """,
-                (conversation_id, HOTEL_ID),
-            )
-            conversation = cursor.fetchone()
-
-            if conversation is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Conversation introuvable.",
-                )
-
-            if conversation["etat"] not in (
-                "collecte_coordonnees",
-                "attente_confirmation",
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Préparez d'abord une proposition de réservation.",
-                )
-
-            proposition = conversation["proposition"]
-
-            if proposition is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Aucune proposition à confirmer.",
-                )
-
-            coordonnees = {
-                "nom": nom,
-                "telephone": telephone,
-            }
-
-            recapitulatif = (
-                f"Réservation au nom de {nom}, "
-                f"téléphone {telephone}. "
-                f"Chambre {proposition['numero']}, "
-                f"du {proposition['date_arrivee']} "
-                f"au {proposition['date_depart']}, "
-                f"pour {proposition['nombre_personnes']} personne(s). "
-                f"Montant proposé : {proposition['prix_total']} euros. "
-                "Confirmez-vous cette réservation ?"
-            )
-
-            cursor.execute(
-                """
-                UPDATE conversations_assistant
-                SET coordonnees_client = %s,
-                    etat = 'attente_confirmation',
-                    modifie_le = CURRENT_TIMESTAMP
-                WHERE id = %s AND hotel_id = %s;
-                """,
-                (
-                    Jsonb(coordonnees),
-                    conversation_id,
-                    HOTEL_ID,
-                ),
-            )
-
-    return {
-        "conversation_id": str(conversation_id),
-        "etat": "attente_confirmation",
-        "reponse": recapitulatif,
-    }
 class ConfirmationConversation(BaseModel):
     confirme: bool = Field(strict=True)
 
 
-@router.post("/conversations/{conversation_id}/confirmer")
-def confirmer_conversation(
-    conversation_id: UUID,
-    demande: ConfirmationConversation,
-):
-    if not demande.confirme:
-        return {
-            "reponse": "Aucune réservation n'a été enregistrée.",
-            "confirmee": False,
-        }
+def normaliser(texte: str) -> str:
+    texte = unicodedata.normalize("NFKD", texte.casefold())
+    texte = "".join(c for c in texte if not unicodedata.combining(c))
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", texte).split())
 
+
+# Listes fermées : ne jamais confirmer par simple présence du mot « confirme ».
+def accord_explicite(texte: str) -> bool:
+    commande = normaliser(texte)
+    commande = re.sub(r"^(?:d accord |oui d accord )", "", commande)
+    commande = re.sub(r"(?: s il vous plait| merci(?: beaucoup)?)$", "", commande)
+    return commande in {
+        "oui je confirme", "je confirme", "je confirme la reservation",
+        "oui je confirme la reservation", "je confirme ma reservation",
+        "oui je confirme ma reservation", "oui c est bon je confirme",
+    }
+
+
+def demande_fin(texte: str) -> bool:
+    commande = normaliser(texte)
+    return commande in {
+        "annuler", "annuler la demande", "arreter", "stop",
+        "arreter la conversation", "terminer", "terminer la conversation",
+        "fin de conversation", "au revoir", "merci au revoir",
+        "c est tout", "c est tout merci", "merci c est tout",
+        "non merci au revoir", "je veux arreter", "je veux terminer la conversation",
+    }
+
+
+def lire_telephone(texte: str) -> str | None:
+    # Accepte les numéros internationaux et les mobiles français locaux.
+    # Une transcription ambiguë est refusée plutôt que devinée.
+    texte = texte.strip().lower()
+    texte = re.sub(
+        r"^(?:mon (?:numero|numéro)(?: de téléphone| de telephone)? est|"
+        r"mon téléphone est|mon telephone est|c'est|c’est)\s*:?\s*", "", texte,
+    )
+    mots = normaliser(texte).split()
+    chiffres = {"zero": "0", "un": "1", "une": "1", "deux": "2",
+                "trois": "3", "quatre": "4", "cinq": "5", "six": "6",
+                "sept": "7", "huit": "8", "neuf": "9"}
+    if mots and all(m in chiffres or m.isdigit() for m in mots):
+        prefixe = "+" if texte.startswith("+") else ""
+        numero = prefixe + "".join(chiffres.get(m, m) for m in mots)
+    elif re.fullmatch(r"[+\d\s().-]+", texte):
+        numero = re.sub(r"[\s().-]", "", texte)
+    else:
+        return None
+    if numero.startswith("00"):
+        numero = "+" + numero[2:]
+    if re.fullmatch(r"0[1-9]\d{8}", numero):
+        numero = "+33" + numero[1:]
+    if numero.startswith("+33") and not re.fullmatch(r"\+33[1-9]\d{8}", numero):
+        return None
+    return numero if re.fullmatch(r"\+[1-9]\d{7,14}", numero) else None
+
+
+def lire_nom(texte: str) -> str | None:
+    nom = re.sub(
+        r"^(?:je m'appelle|je m’appelle|mon nom est|au nom de)\s+", "",
+        texte.strip(), flags=re.IGNORECASE,
+    ).strip(" .,!?:;")
+    if (not 2 <= len(nom) <= 150 or any(c.isdigit() for c in nom)
+            or normaliser(nom) in {"oui", "non", "je confirme", "bonjour", "annuler"}
+            or not any(c.isalpha() for c in nom)):
+        return None
+    return nom
+
+
+def charger_conversation(cursor, conversation_id, verrouiller=True):
+    cursor.execute(
+        """SELECT historique, proposition, coordonnees_client, etat, reservation_id
+           FROM conversations_assistant
+           WHERE id = %s AND hotel_id = %s"""
+        + (" FOR UPDATE;" if verrouiller else ";"),
+        (conversation_id, HOTEL_ID),
+    )
+    conversation = cursor.fetchone()
+    if conversation is None:
+        raise HTTPException(404, "Conversation introuvable.")
+    return conversation
+
+
+def euros(montant):
+    return f"{Decimal(str(montant)):.2f}".replace(".", ",") + " euros"
+
+
+def recapitulatif(proposition, coordonnees):
+    debut = date.fromisoformat(proposition["date_arrivee"]).strftime("%d/%m/%Y")
+    fin = date.fromisoformat(proposition["date_depart"]).strftime("%d/%m/%Y")
+    montant = Decimal(str(proposition["prix_total"]))
+    moitie = (montant / 2).quantize(Decimal("0.01"), rounding="ROUND_HALF_UP")
+    telephone = " ".join(coordonnees["telephone"])
+    return (
+        f"Récapitulatif : chambre {proposition['numero']}, du {debut} au {fin}, "
+        f"pour {proposition['nombre_personnes']} personne(s), "
+        f"au nom de {coordonnees['nom']}. Téléphone : {telephone}. "
+        f"Total : {euros(montant)}. La moitié à régler est de {euros(moitie)}, "
+        "le solde sera à payer à l'hôtel. "
+        "Aucune réservation n'est encore enregistrée. "
+        "Pour valider ces informations, dites exactement : Oui, je confirme. "
+        "Pour corriger, dites : Modifier la réservation."
+    )
+
+
+def resultat(conversation_id, conversation, reponse, **extra):
+    return {
+        "conversation_id": str(conversation_id),
+        "etat": conversation["etat"],
+        "reponse": reponse,
+        "proposition": conversation.get("proposition"),
+        "reservation_id": conversation.get("reservation_id"),
+        "confirmee": conversation["etat"] == "confirmee",
+        "terminee": conversation["etat"] in {"confirmee", "abandonnee"},
+        **extra,
+    }
+
+
+def sauvegarder(cursor, conversation_id, conversation):
+    cursor.execute(
+        """UPDATE conversations_assistant
+           SET historique = %s, proposition = %s, coordonnees_client = %s,
+               etat = %s, reservation_id = %s, modifie_le = CURRENT_TIMESTAMP
+           WHERE id = %s AND hotel_id = %s;""",
+        (Jsonb(conversation["historique"]),
+         Jsonb(conversation["proposition"]) if conversation["proposition"] else None,
+         Jsonb(conversation["coordonnees_client"]) if conversation["coordonnees_client"] else None,
+         conversation["etat"], conversation["reservation_id"], conversation_id, HOTEL_ID),
+    )
+
+
+def confirmer_avec_curseur(cursor, conversation_id, conversation):
+    # Le verrou de conversation et la contrainte anti-chevauchement SQL
+    # garantissent une seule réservation, y compris en cas de double requête.
+    if conversation["etat"] == "confirmee":
+        return resultat(conversation_id, conversation,
+                        f"Votre réservation est déjà confirmée. Référence {conversation['reservation_id']}.")
+    if conversation["etat"] != "attente_confirmation":
+        raise HTTPException(409, "Les coordonnées et le récapitulatif sont nécessaires.")
+    proposition = conversation["proposition"]
+    coordonnees = conversation["coordonnees_client"]
+    recherche = RechercheDisponibilites.model_validate(proposition)
+    if recherche.date_arrivee < date.today() or recherche.date_depart <= recherche.date_arrivee:
+        raise HTTPException(409, "Les dates ne sont plus valides. Recommencez la recherche.")
+    cursor.execute(
+        """SELECT t.capacite, t.prix_base FROM chambres AS c
+           JOIN types_chambres AS t ON t.id = c.type_chambre_id
+           WHERE c.id = %s AND t.hotel_id = %s AND c.active = TRUE
+           FOR SHARE OF c, t;""", (proposition["chambre_id"], HOTEL_ID),
+    )
+    chambre = cursor.fetchone()
+    if chambre is None or chambre["capacite"] < recherche.nombre_personnes:
+        raise HTTPException(409, "Cette chambre n'est plus adaptée. Recommencez la recherche.")
+    prix_total = Decimal(str(chambre["prix_base"])) * (recherche.date_depart - recherche.date_arrivee).days
+    if prix_total != Decimal(str(proposition["prix_total"])):
+        raise HTTPException(409, "Le tarif a changé. Recherchez et confirmez une nouvelle proposition.")
+    cursor.execute(
+        """INSERT INTO clients (hotel_id, nom, telephone)
+           VALUES (%s, %s, %s) RETURNING id;""",
+        (HOTEL_ID, coordonnees["nom"], coordonnees["telephone"]),
+    )
+    client_id = cursor.fetchone()["id"]
+    cursor.execute(
+        """INSERT INTO reservations
+           (chambre_id, client_id, date_arrivee, date_depart,
+            nombre_personnes, prix_total, statut)
+           VALUES (%s, %s, %s, %s, %s, %s, 'confirmee') RETURNING id;""",
+        (proposition["chambre_id"], client_id, recherche.date_arrivee,
+         recherche.date_depart, recherche.nombre_personnes, prix_total),
+    )
+    reference = cursor.fetchone()["id"]
+    # Écrase aussi une ancienne valeur J-10 produite par un éventuel trigger.
+    cursor.execute(
+        """UPDATE reservations SET montant_a_payer = ROUND(prix_total * 0.50, 2),
+           statut_paiement = 'en_attente', date_envoi_paiement = CURRENT_DATE
+           WHERE id = %s;""", (reference,),
+    )
+    cursor.execute(
+        """INSERT INTO envois_sms (reservation_id, type_message, statut)
+           VALUES (%s, 'rappel_paiement', 'prepare')
+           ON CONFLICT (reservation_id, type_message) DO NOTHING;""", (reference,),
+    )
+    conversation["etat"] = "confirmee"
+    conversation["reservation_id"] = reference
+    moitie = (prix_total / 2).quantize(Decimal("0.01"), rounding="ROUND_HALF_UP")
+    return resultat(
+        conversation_id, conversation,
+        f"Votre réservation est confirmée. Votre référence est {reference}. "
+        f"Le total est de {euros(prix_total)}. Le montant à régler est de {euros(moitie)}, "
+        "soit la moitié du séjour. Le solde sera à payer à l'hôtel. "
+        "La demande de SMS de paiement est préparée. Merci et au revoir.",
+        sms_statut="prepare",
+    )
+
+
+@router.post("/conversations", status_code=201)
+def creer_conversation():
+    conversation_id = uuid4()
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO conversations_assistant (id, hotel_id, etat)
+                   VALUES (%s, %s, 'discussion');""", (conversation_id, HOTEL_ID),
+            )
+    return {
+        "conversation_id": str(conversation_id), "etat": "discussion",
+        "message": "Bonjour, pour quelles dates et combien de voyageurs cherchez-vous une chambre ?",
+    }
+
+
+@router.get("/conversations/{conversation_id}")
+def recuperer_conversation(conversation_id: UUID):
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            conversation = charger_conversation(cursor, conversation_id, False)
+    historique = conversation["historique"] or []
+    # Reprise après une interruption du microphone ou une réponse réseau perdue.
+    if (historique and historique[-1].get("resultat")
+            and conversation["etat"] not in {"confirmee", "abandonnee"}):
+        return {**historique[-1]["resultat"], "terminee": False}
+    if conversation["etat"] == "confirmee":
+        texte = f"Votre réservation est confirmée. Référence {conversation['reservation_id']}."
+    elif conversation["etat"] == "attente_confirmation":
+        texte = recapitulatif(conversation["proposition"], conversation["coordonnees_client"])
+    elif conversation["etat"] == "collecte_coordonnees":
+        texte = "Quel est votre numéro de téléphone ?" if (conversation["coordonnees_client"] or {}).get("nom") else "Quel est votre nom complet ?"
+    elif conversation["etat"] == "abandonnee":
+        texte = "Cette conversation est terminée. Démarrez une nouvelle conversation."
+    else:
+        texte = "Bonjour, indiquez vos dates de séjour et le nombre de voyageurs."
+    return resultat(conversation_id, conversation, texte)
+
+
+@router.post("/conversations/{conversation_id}/messages")
+def envoyer_message_conversation(conversation_id: UUID, demande: MessageConversation):
+    texte = demande.message.strip()
+    if not texte:
+        raise HTTPException(400, "Le message ne peut pas être vide.")
+    commande = normaliser(texte)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            conversation = charger_conversation(cursor, conversation_id)
+            historique = conversation["historique"] or []
+            # Rejouer la même requête ne fait pas avancer deux fois la collecte.
+            if demande.request_id:
+                for entree in historique:
+                    if entree.get("request_id") == str(demande.request_id):
+                        if entree["texte_requete"] != texte:
+                            raise HTTPException(409, "Cet identifiant de requête a déjà été utilisé.")
+                        return entree["resultat"]
+            etat = conversation["etat"]
+            if etat == "confirmee":
+                reponse = resultat(conversation_id, conversation,
+                    f"Votre réservation est déjà confirmée. Référence {conversation['reservation_id']}.")
+            elif etat == "abandonnee":
+                reponse = resultat(conversation_id, conversation, "Cette conversation est terminée.")
+            elif demande_fin(texte):
+                conversation["etat"] = "abandonnee"
+                reponse = resultat(conversation_id, conversation, "La conversation est terminée. Aucune réservation n'a été enregistrée. Au revoir.")
+            elif commande in {"modifier la reservation", "modifier", "changer les dates", "corriger"}:
+                conversation.update(etat="discussion", proposition=None, coordonnees_client=None)
+                historique = []  # Les coordonnées ne repartent pas vers le modèle.
+                reponse = resultat(conversation_id, conversation,
+                    "Reprenons la demande. Indiquez vos dates et le nombre de voyageurs.")
+            elif etat == "collecte_coordonnees":
+                coordonnees = conversation["coordonnees_client"] or {}
+                if not coordonnees.get("nom"):
+                    nom = lire_nom(texte)
+                    if nom:
+                        coordonnees = {"nom": nom}
+                        conversation["coordonnees_client"] = coordonnees
+                        question = f"Merci {nom}. Quel est votre numéro de téléphone ? Dictez-le chiffre par chiffre, avec l'indicatif pays si nécessaire."
+                    else:
+                        question = "Indiquez seulement votre nom et votre prénom, ou dites Modifier la réservation."
+                    reponse = resultat(conversation_id, conversation, question)
+                else:
+                    telephone = lire_telephone(texte)
+                    if telephone:
+                        coordonnees["telephone"] = telephone
+                        conversation["coordonnees_client"] = coordonnees
+                        conversation["etat"] = "attente_confirmation"
+                        question = recapitulatif(conversation["proposition"], coordonnees)
+                    else:
+                        question = "Je n'ai pas reconnu un numéro valide. Dictez les chiffres séparément. Pour un numéro hors France, commencez par zéro zéro puis l'indicatif pays."
+                    reponse = resultat(conversation_id, conversation, question)
+            elif etat == "attente_confirmation":
+                if accord_explicite(texte):
+                    try:
+                        # Sous-transaction : un conflit annule client + réservation.
+                        with connection.transaction():
+                            reponse = confirmer_avec_curseur(cursor, conversation_id, conversation)
+                    except (ExclusionViolation, HTTPException) as erreur:
+                        if isinstance(erreur, HTTPException) and erreur.status_code != 409:
+                            raise
+                        conversation.update(etat="discussion", proposition=None, coordonnees_client=None, reservation_id=None)
+                        historique = []
+                        explication = erreur.detail if isinstance(erreur, HTTPException) else "Cette chambre vient d'être réservée sur ces dates."
+                        reponse = resultat(conversation_id, conversation,
+                            f"{explication} Aucune réservation n'a été créée. Indiquez à nouveau vos dates et le nombre de voyageurs.")
+                elif commande in {"non", "non merci", "je ne confirme pas"}:
+                    conversation.update(etat="discussion", proposition=None, coordonnees_client=None)
+                    historique = []
+                    reponse = resultat(conversation_id, conversation,
+                        "Aucune réservation n'a été créée. Indiquez les nouveaux critères, ou dites Annuler.")
+                else:
+                    reponse = resultat(conversation_id, conversation,
+                        "Je n'ai pas enregistré de réservation. Dites Oui, je confirme pour valider le récapitulatif, ou Modifier la réservation pour le corriger.")
+            else:
+                # Seule la recherche passe par OpenRouter. La collecte et l'accord
+                # sont traités localement après proposition.
+                contexte = [MessageHistorique(role=e["role"], content=e["content"]) for e in historique[-20:]]
+                sortie = discuter(MessageAssistant(message=texte, historique=contexte, mode="vocal"))
+                if sortie.get("proposition"):
+                    conversation.update(etat="collecte_coordonnees", proposition=sortie["proposition"], coordonnees_client=None)
+                    p = conversation["proposition"]
+                    question = (
+                        f"La chambre {p['numero']} est proposée du {p['date_arrivee']} "
+                        f"au {p['date_depart']} pour {p['nombre_personnes']} personne(s), "
+                        f"au total {euros(p['prix_total'])}. Elle n'est pas encore réservée. "
+                        "Quel est votre nom complet ?"
+                    )
+                    reponse = resultat(conversation_id, conversation, question)
+                else:
+                    reponse = resultat(conversation_id, conversation, sortie["reponse"])
+            historique.extend([
+                {"role": "user", "content": texte},
+                {"role": "assistant", "content": reponse["reponse"],
+                 "request_id": str(demande.request_id) if demande.request_id else None,
+                 "texte_requete": texte, "resultat": reponse},
+            ])
+            conversation["historique"] = historique[-20:]
+            sauvegarder(cursor, conversation_id, conversation)
+    return reponse
+
+
+@router.post("/conversations/{conversation_id}/coordonnees")
+def enregistrer_coordonnees(conversation_id: UUID, demande: CoordonneesConversation):
+    nom, telephone = lire_nom(demande.nom), lire_telephone(demande.telephone)
+    if not nom or not telephone:
+        raise HTTPException(422, "Nom ou numéro de téléphone invalide.")
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            conversation = charger_conversation(cursor, conversation_id)
+            if conversation["etat"] not in {"collecte_coordonnees", "attente_confirmation"}:
+                raise HTTPException(409, "Préparez d'abord une proposition.")
+            conversation["coordonnees_client"] = {"nom": nom, "telephone": telephone}
+            conversation["etat"] = "attente_confirmation"
+            # Invalide l'ancienne question de reprise.
+            conversation["historique"] = []
+            sauvegarder(cursor, conversation_id, conversation)
+    return resultat(conversation_id, conversation, recapitulatif(conversation["proposition"], conversation["coordonnees_client"]))
+
+
+@router.post("/conversations/{conversation_id}/confirmer")
+def confirmer_conversation(conversation_id: UUID, demande: ConfirmationConversation):
+    if not demande.confirme:
+        return {"confirmee": False, "reponse": "Aucune nouvelle réservation n'a été enregistrée."}
     try:
         with get_connection() as connection:
             with connection.cursor() as cursor:
-                # Une seule confirmation à la fois par conversation.
-                cursor.execute(
-                    """
-                    SELECT proposition, coordonnees_client,
-                           etat, reservation_id
-                    FROM conversations_assistant
-                    WHERE id = %s AND hotel_id = %s
-                    FOR UPDATE;
-                    """,
-                    (conversation_id, HOTEL_ID),
-                )
-                conversation = cursor.fetchone()
-
-                if conversation is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="Conversation introuvable.",
-                    )
-
-                # Un deuxième appel retourne la même référence.
-                if conversation["etat"] == "confirmee":
-                    reference = conversation["reservation_id"]
-
-                    return {
-                        "confirmee": True,
-                        "reservation_id": reference,
-                        "reponse": (
-                            "Votre réservation est déjà confirmée. "
-                            f"Votre référence est {reference}."
-                        ),
-                    }
-
-                if conversation["etat"] != "attente_confirmation":
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "Les coordonnées et le récapitulatif "
-                            "doivent être préparés avant confirmation."
-                        ),
-                    )
-
-                proposition = conversation["proposition"]
-                coordonnees = conversation["coordonnees_client"]
-
-                recherche = RechercheDisponibilites(
-                    date_arrivee=proposition["date_arrivee"],
-                    date_depart=proposition["date_depart"],
-                    nombre_personnes=proposition["nombre_personnes"],
-                )
-
-                if (
-                    recherche.date_arrivee < date.today()
-                    or recherche.date_depart <= recherche.date_arrivee
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Les dates ne sont plus valides.",
-                    )
-
-                cursor.execute(
-                    """
-                    SELECT t.capacite, t.prix_base
-                    FROM chambres AS c
-                    JOIN types_chambres AS t
-                        ON t.id = c.type_chambre_id
-                    WHERE c.id = %s
-                      AND t.hotel_id = %s
-                      AND c.active = TRUE
-                    FOR SHARE OF c, t;
-                    """,
-                    (proposition["chambre_id"], HOTEL_ID),
-                )
-                chambre = cursor.fetchone()
-
-                if chambre is None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Cette chambre n'est plus proposée.",
-                    )
-
-                if recherche.nombre_personnes > chambre["capacite"]:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="La capacité de la chambre est insuffisante.",
-                    )
-
-                nuits = (
-                    recherche.date_depart - recherche.date_arrivee
-                ).days
-                prix_total = chambre["prix_base"] * nuits
-
-                if prix_total != Decimal(str(proposition["prix_total"])):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "Le tarif a changé. Préparez une nouvelle "
-                            "proposition et confirmez le nouveau prix."
-                        ),
-                    )
-
-                cursor.execute(
-                    """
-                    INSERT INTO clients (hotel_id, nom, telephone)
-                    VALUES (%s, %s, %s)
-                    RETURNING id;
-                    """,
-                    (
-                        HOTEL_ID,
-                        coordonnees["nom"],
-                        coordonnees["telephone"],
-                    ),
-                )
-                client_id = cursor.fetchone()["id"]
-
-                # La contrainte PostgreSQL refuse tout chevauchement.
-                cursor.execute(
-                    """
-                    INSERT INTO reservations (
-                        chambre_id, client_id,
-                        date_arrivee, date_depart,
-                        nombre_personnes, prix_total
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id;
-                    """,
-                    (
-                        proposition["chambre_id"],
-                        client_id,
-                        recherche.date_arrivee,
-                        recherche.date_depart,
-                        recherche.nombre_personnes,
-                        prix_total,
-                    ),
-                )
-                reservation_id = cursor.fetchone()["id"]
-                cursor.execute(
-                    """
-                    UPDATE reservations
-                    SET montant_a_payer = ROUND(prix_total * 0.50, 2),
-                        statut_paiement = 'en_attente',
-                        date_envoi_paiement = GREATEST(
-                            date_arrivee - 10,
-                            CURRENT_DATE
-                        )
-                    WHERE id = %s;
-                    """,
-                    (reservation_id,),
-                )
-
-                cursor.execute(
-                    """
-                    UPDATE conversations_assistant
-                    SET etat = 'confirmee',
-                        reservation_id = %s,
-                        modifie_le = CURRENT_TIMESTAMP
-                    WHERE id = %s AND hotel_id = %s;
-                    """,
-                    (reservation_id, conversation_id, HOTEL_ID),
-                )
-                cursor.execute(
-                    """
-                    INSERT INTO envois_sms (
-                        reservation_id,
-                        type_message,
-                        statut
-                    )
-                    VALUES (
-                        %s,
-                        'rappel_paiement',
-                        'prepare'
-                    )
-                    ON CONFLICT (
-                        reservation_id,
-                        type_message
-                    )
-                    DO NOTHING;
-                    """,
-                    (reservation_id,),
-                )
-
-        # Le client, la réservation et l'état sont validés ensemble.
-        return {
-            "confirmee": True,
-            "reservation_id": reservation_id,
-            "reponse": (
-                "Votre réservation est confirmée. "
-                f"Votre référence est {reservation_id}. "
-                "Paiement à l'hôtel."
-            ),
-        }
-
+                conversation = charger_conversation(cursor, conversation_id)
+                reponse = confirmer_avec_curseur(cursor, conversation_id, conversation)
+                conversation["historique"] = []
+                sauvegarder(cursor, conversation_id, conversation)
+        return reponse
     except ExclusionViolation:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "La chambre vient d'être réservée sur ces dates. "
-                "Veuillez choisir une autre proposition."
-            ),
-        )
+        raise HTTPException(409, "La chambre vient d'être réservée. Choisissez une nouvelle proposition.")
